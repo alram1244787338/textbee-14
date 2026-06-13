@@ -587,6 +587,74 @@ export class BillingService {
     return { success: true, plan: plan.name }
   }
 
+  /**
+   * Verify that the user has an active (non-cancelled, non-unpaid) subscription.
+   * Free-plan users are always considered active since the free plan is the
+   * fallback tier. Throws `subscriptionInactiveException` when the subscription
+   * has been explicitly cancelled or is in an unpaid state.
+   */
+  async assertActiveSubscription(userId: string): Promise<void> {
+    const user = await this.userModel.findById(userId)
+    if (!user) {
+      // Let the AuthGuard handle missing users; do not leak info here
+      return
+    }
+
+    // Banned users are already blocked by the AuthGuard — belt and suspenders
+    if (user.isBanned) {
+      throw new HttpException(
+        {
+          error: 'Your account has been suspended. Please contact support.',
+          code: 'ACCOUNT_BANNED',
+        },
+        HttpStatus.FORBIDDEN,
+      )
+    }
+
+    const subscription = await this.subscriptionModel
+      .findOne({ user: new Types.ObjectId(userId), isActive: true })
+      .populate('plan')
+
+    // No active subscription row — the user falls back to the free tier, which
+    // is always considered valid (free plan does not expire).
+    if (!subscription) {
+      return
+    }
+
+    // Explicitly cancelled or unpaid subscriptions must not be allowed to
+    // perform sensitive operations even if `isActive` has not yet been flipped
+    // by the webhook processor.
+    const status = (subscription.status || '').toLowerCase()
+    const blockedStatuses = ['canceled', 'cancelled', 'unpaid']
+    if (blockedStatuses.includes(status)) {
+      throw new HttpException(
+        {
+          error:
+            'Your subscription is no longer active. Please renew to continue using this feature.',
+          code: 'SUBSCRIPTION_INACTIVE',
+          subscriptionStatus: status,
+        },
+        HttpStatus.PAYMENT_REQUIRED,
+      )
+    }
+
+    // Check if the subscription end date has passed
+    if (
+      subscription.subscriptionEndDate &&
+      new Date(subscription.subscriptionEndDate) < new Date()
+    ) {
+      throw new HttpException(
+        {
+          error:
+            'Your subscription has expired. Please renew to continue using this feature.',
+          code: 'SUBSCRIPTION_INACTIVE',
+          subscriptionStatus: 'expired',
+        },
+        HttpStatus.PAYMENT_REQUIRED,
+      )
+    }
+  }
+
   async canPerformAction(
     userId: string,
     action: 'send_sms' | 'receive_sms' | 'bulk_send_sms',

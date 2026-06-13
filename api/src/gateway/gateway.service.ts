@@ -324,6 +324,11 @@ export class GatewayService {
       )
     }
 
+    // Verify subscription is still active before allowing SMS sends
+    await this.billingService.assertActiveSubscription(
+      device.user.toString(),
+    )
+
     await this.billingService.canPerformAction(
       device.user.toString(),
       'send_sms',
@@ -525,6 +530,11 @@ export class GatewayService {
         HttpStatus.BAD_REQUEST,
       )
     }
+
+    // Verify subscription is still active before allowing bulk SMS sends
+    await this.billingService.assertActiveSubscription(
+      device.user.toString(),
+    )
 
     await this.billingService.canPerformAction(
       device.user.toString(),

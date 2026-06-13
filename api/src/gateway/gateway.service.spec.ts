@@ -76,6 +76,7 @@ describe('GatewayService', () => {
 
   const mockBillingService = {
     canPerformAction: jest.fn(),
+    assertActiveSubscription: jest.fn(),
   }
 
   const mockSmsQueueService = {
@@ -382,8 +383,9 @@ describe('GatewayService', () => {
         exec: jest.fn().mockResolvedValue(true),
       }))
       mockBillingService.canPerformAction.mockResolvedValue(true)
+      mockBillingService.assertActiveSubscription.mockResolvedValue(undefined)
       mockSmsQueueService.isQueueEnabled.mockReturnValue(false)
-      
+
       // Fix the mock
       jest.spyOn(firebaseAdmin.messaging(), 'sendEach').mockResolvedValue(mockFcmResponse)
     })
@@ -510,8 +512,9 @@ describe('GatewayService', () => {
         exec: jest.fn().mockResolvedValue(true),
       }))
       mockBillingService.canPerformAction.mockResolvedValue(true)
+      mockBillingService.assertActiveSubscription.mockResolvedValue(undefined)
       mockSmsQueueService.isQueueEnabled.mockReturnValue(false)
-      
+
       // Fix the mock
       jest.spyOn(firebaseAdmin.messaging(), 'sendEach').mockResolvedValue(mockFcmResponse)
     })
