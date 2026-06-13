@@ -38,6 +38,9 @@ export class SMS {
   @Prop({ type: Date })
   receivedAt: Date
 
+  @Prop({ type: String, index: true })
+  fingerprint: string
+
   // fields for outgoing messages
   @Prop({ type: String })
   recipient: string

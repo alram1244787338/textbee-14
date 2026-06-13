@@ -183,6 +183,13 @@ export class ReceivedSMSDTO {
     description: 'The time the message was created',
   })
   receivedAtInMillis?: number
+
+  @ApiProperty({
+    type: String,
+    required: false,
+    description: 'Fingerprint hash of sender+message+timestamp for deduplication',
+  })
+  fingerprint?: string
 }
 
 export class DeviceDTO {

@@ -825,7 +825,26 @@ export class GatewayService {
       ? new Date(dto.receivedAtInMillis)
       : dto.receivedAt
 
-    // Deduplication: Check for existing SMS with same device, sender, message, and receivedAt (within ±5 seconds tolerance)
+    // --- Deduplication ---
+    // Strategy 1: exact fingerprint match (preferred — device generates a
+    // deterministic hash of sender+message+timestamp).
+    if (dto.fingerprint) {
+      const existingByFingerprint = await this.smsModel.findOne({
+        device: device._id,
+        fingerprint: dto.fingerprint,
+      })
+
+      if (existingByFingerprint) {
+        console.log(
+          `[RECEIVE_DEDUP:fingerprint] device=${deviceId} sender=${dto.sender} ` +
+          `fingerprint=${dto.fingerprint} — returning existing record ${existingByFingerprint._id}`,
+        )
+        return existingByFingerprint
+      }
+    }
+
+    // Strategy 2: fuzzy time-window dedup (fallback for older clients that
+    // don't send a fingerprint).
     const toleranceMs = 5000 // 5 seconds
     const toleranceStart = new Date(receivedAt.getTime() - toleranceMs)
     const toleranceEnd = new Date(receivedAt.getTime() + toleranceMs)
@@ -843,7 +862,8 @@ export class GatewayService {
 
     if (existingSMS) {
       console.log(
-        `Duplicate SMS detected for device ${deviceId}, sender ${dto.sender}, returning existing record: ${existingSMS._id}`,
+        `[RECEIVE_DEDUP:timewindow] device=${deviceId} sender=${dto.sender} ` +
+        `— returning existing record ${existingSMS._id}`,
       )
       return existingSMS
     }
@@ -856,6 +876,7 @@ export class GatewayService {
       status: 'received',
       sender: dto.sender,
       receivedAt,
+      ...(dto.fingerprint ? { fingerprint: dto.fingerprint } : {}),
     })
 
     this.deviceModel
@@ -1002,10 +1023,33 @@ export class GatewayService {
     }
   }
 
+  /**
+   * Status rank defines the ordering of SMS lifecycle states.
+   * A higher-rank status must never be overwritten by a lower-rank one.
+   * This prevents out-of-order delivery (e.g. "sent" arriving after "delivered")
+   * from downgrading an already-confirmed status.
+   *
+   * Lifecycle: pending → dispatched → sent → delivered
+   *                                ↘ failed (terminal)
+   *                                ↘ unknown  (terminal, set by timeout cron)
+   */
+  private static readonly STATUS_RANK: Record<string, number> = {
+    pending: 0,
+    dispatched: 1,
+    sent: 2,
+    delivered: 3,
+    // failed and unknown are terminal — they should not be overwritten by
+    // transient states, but a retry that eventually succeeds may upgrade
+    // failed → sent → delivered.
+    failed: 2,
+    unknown: 1,
+    received: 3, // received is a terminal state for inbound SMS
+  }
+
   async updateSMSStatus(deviceId: string, dto: UpdateSMSStatusDTO): Promise<any> {
 
     const device = await this.deviceModel.findById(deviceId);
-    
+
     if (!device) {
       throw new HttpException(
         {
@@ -1015,9 +1059,9 @@ export class GatewayService {
         HttpStatus.NOT_FOUND,
       );
     }
-    
+
     const sms = await this.smsModel.findById(dto.smsId);
-    
+
     if (!sms) {
       throw new HttpException(
         {
@@ -1027,7 +1071,7 @@ export class GatewayService {
         HttpStatus.NOT_FOUND,
       );
     }
-    
+
     // Verify the SMS belongs to this device
     if (sms.device.toString() !== deviceId) {
       throw new HttpException(
@@ -1038,14 +1082,62 @@ export class GatewayService {
         HttpStatus.FORBIDDEN,
       );
     }
-    
+
     // Normalize status to lowercase for comparison
     const normalizedStatus = dto.status.toLowerCase();
-    
+
+    // --- Status ordering guard ---
+    // Prevent a lower-rank (older) status from overwriting a higher-rank (newer) one.
+    const currentStatus = (sms.status || 'pending').toLowerCase();
+    const currentRank = GatewayService.STATUS_RANK[currentStatus] ?? -1;
+    const incomingRank = GatewayService.STATUS_RANK[normalizedStatus] ?? -1;
+
+    if (incomingRank < currentRank) {
+      // This is a status regression — log it for diagnostics but do NOT apply it.
+      console.warn(
+        `[STATUS_REGRESSION] smsId=${dto.smsId} deviceId=${deviceId} ` +
+        `current=${currentStatus}(rank=${currentRank}) ` +
+        `incoming=${normalizedStatus}(rank=${incomingRank}) — update rejected`,
+      );
+      return {
+        success: true,
+        message: 'SMS status update ignored: incoming status is older than current status',
+        currentStatus,
+        ignoredStatus: normalizedStatus,
+        reason: 'status_regression',
+      };
+    }
+
+    // --- Idempotency: same status with same or older timestamp → skip ---
+    if (incomingRank === currentRank && normalizedStatus === currentStatus) {
+      // Already at this status. Only re-apply if the incoming timestamp is
+      // strictly newer (e.g. a retry that carries updated metadata).
+      const incomingTs =
+        dto.sentAtInMillis || dto.deliveredAtInMillis || dto.failedAtInMillis || 0;
+      const currentTs =
+        (sms.sentAt?.getTime()) ||
+        (sms.deliveredAt?.getTime()) ||
+        (sms.failedAt?.getTime()) ||
+        (sms.dispatchedAt?.getTime()) ||
+        0;
+      if (incomingTs > 0 && incomingTs <= currentTs) {
+        console.log(
+          `[STATUS_DEDUP] smsId=${dto.smsId} deviceId=${deviceId} ` +
+          `status=${normalizedStatus} — duplicate update skipped`,
+        );
+        return {
+          success: true,
+          message: 'SMS status update skipped: duplicate update for same status',
+          currentStatus,
+          reason: 'duplicate',
+        };
+      }
+    }
+
     const updateData: any = {
       status: normalizedStatus, // Store normalized status
     };
-    
+
     // Update timestamps based on status
     if (normalizedStatus === 'sent' && dto.sentAtInMillis) {
       updateData.sentAt = new Date(dto.sentAtInMillis);
@@ -1055,33 +1147,54 @@ export class GatewayService {
       updateData.failedAt = new Date(dto.failedAtInMillis);
       updateData.errorCode = dto.errorCode;
       updateData.errorMessage = dto.errorMessage || 'Unknown error';
+    } else if (normalizedStatus === 'failed') {
+      // failed status without timestamp — still record error metadata
+      updateData.errorCode = dto.errorCode;
+      updateData.errorMessage = dto.errorMessage || 'Unknown error';
     }
-    
+
     // Update the SMS
-const updatedSms = await this.smsModel.findByIdAndUpdate(
-  dto.smsId,
-  { $set: updateData },
-  { new: true } 
-);
-    
-    // Check if all SMS in batch have the same status, then update batch status
+    const updatedSms = await this.smsModel.findByIdAndUpdate(
+      dto.smsId,
+      { $set: updateData },
+      { new: true }
+    );
+
+    // Check if all SMS in batch have reached a terminal state, then update batch status
     if (dto.smsBatchId) {
       const smsBatch = await this.smsBatchModel.findById(dto.smsBatchId);
       if (smsBatch) {
         const allSmsInBatch = await this.smsModel.find({ smsBatch: dto.smsBatchId });
-        
-        // Check if all SMS in batch have the same status (case insensitive)
-        const allHaveSameStatus = allSmsInBatch.every(sms => sms.status.toLowerCase() === normalizedStatus);
-        
-        if (allHaveSameStatus) {
-          const smsBatchStatus = normalizedStatus === 'failed' ? 'failed' : 'completed';
-          await this.smsBatchModel.findByIdAndUpdate(dto.smsBatchId, { 
-            $set: { status: smsBatchStatus } 
+
+        const terminalStatuses = new Set(['delivered', 'failed', 'unknown']);
+        const allTerminal = allSmsInBatch.every(
+          (s) => terminalStatuses.has((s.status || '').toLowerCase()),
+        );
+
+        if (allTerminal) {
+          const allFailed = allSmsInBatch.every(
+            (s) => (s.status || '').toLowerCase() === 'failed',
+          );
+          const allDelivered = allSmsInBatch.every(
+            (s) => (s.status || '').toLowerCase() === 'delivered',
+          );
+
+          let smsBatchStatus: string;
+          if (allFailed) {
+            smsBatchStatus = 'failed';
+          } else if (allDelivered) {
+            smsBatchStatus = 'completed';
+          } else {
+            smsBatchStatus = 'partial_success';
+          }
+
+          await this.smsBatchModel.findByIdAndUpdate(dto.smsBatchId, {
+            $set: { status: smsBatchStatus, completedAt: new Date() },
           });
         }
       }
     }
-    
+
     // Trigger webhook event for SMS status update
     try {
        let event: WebhookEvent
@@ -1109,7 +1222,7 @@ const updatedSms = await this.smsModel.findByIdAndUpdate(
     } catch (error) {
       console.error('Failed to trigger webhook event:', error);
     }
-    
+
     return {
       success: true,
       message: 'SMS status updated successfully',
